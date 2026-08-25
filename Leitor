@@ -1,0 +1,412 @@
+import streamlit as st
+import re
+import io
+from PyPDF2 import PdfReader, PdfWriter
+from fpdf import FPDF
+from datetime import datetime
+
+# Tratamento para bibliotecas de OCR (com fallback de segurança)
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    OCR_DISPONIVEL = True
+except ImportError:
+    OCR_DISPONIVEL = False
+
+# ==========================================
+# 1. ESTADO DA SESSÃO, ACESSIBILIDADE E HISTÓRICO
+# ==========================================
+st.set_page_config(page_title="Portal GGTAB", layout="wide", page_icon="🏛️", initial_sidebar_state="expanded")
+
+if "historico" not in st.session_state: st.session_state.historico = []
+if "tamanho_fonte" not in st.session_state: st.session_state.tamanho_fonte = 16
+
+def limpar_tudo():
+    st.session_state.dados = {
+        "num_decisao": "", "local": "Brasília", "data_pub": "", 
+        "area": "GGTAB", "tipo_decisao": "", "processo": "", "autuado": "", 
+        "documento": "Não possui", "auto_infracao": "", "enquadramento": "", 
+        "penalidade": "", "resumo": "", "info_adicional": "", "palavras_chave": "", "qtd_paginas": 0
+    }
+    st.session_state.ultimo_arquivo = None
+    st.session_state.preview = False 
+
+if "dados" not in st.session_state: limpar_tudo()
+
+def carregar_do_historico(idx):
+    st.session_state.dados = st.session_state.historico[idx].copy()
+    st.session_state.preview = True
+
+# MENU LATERAL
+with st.sidebar:
+    st.markdown("### 🔎 Acessibilidade Visual")
+    st.session_state.tamanho_fonte = st.slider("Tamanho da Letra (Zoom)", 12, 24, st.session_state.tamanho_fonte)
+    
+    st.markdown("---")
+    st.markdown("### 🗂️ Histórico da Sessão")
+    if not st.session_state.historico:
+        st.info("Nenhum processo gerado nesta sessão.")
+    else:
+        for i, doc in enumerate(reversed(st.session_state.historico)):
+            idx_real = len(st.session_state.historico) - 1 - i
+            # Usa o .get() com fallback vazio para evitar erros em processos sem autuado
+            nome_historico = doc.get('autuado', '')[:15] if doc.get('autuado') else 'Sem nome'
+            if st.button(f"📄 Decisão: {doc.get('num_decisao', 'S/N')} \n({nome_historico}...)", key=f"hist_{idx_real}"):
+                carregar_do_historico(idx_real)
+                st.rerun()
+
+# INJEÇÃO DE CSS (Design e Fonte Dinâmica)
+st.markdown(f"""
+    <style>
+    html, body, [class*="css"] {{ font-size: {st.session_state.tamanho_fonte}px !important; }}
+    .stApp {{ background-color: #F8F9FA; }}
+    .cabecalho-gov {{
+        background-color: #004A99;
+        color: white;
+        padding: 20px;
+        border-radius: 8px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        margin-bottom: 25px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }}
+    .cabecalho-gov h1 {{ color: white; margin: 0; font-size: 24px; }}
+    .badge-versao {{
+        background: rgba(255, 255, 255, 0.2);
+        padding: 5px 12px;
+        border-radius: 20px;
+        font-size: 14px;
+        font-weight: bold;
+    }}
+    .stButton>button {{ border-radius: 6px; transition: all 0.3s ease; }}
+    .stButton>button:hover {{ transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.15); }}
+    </style>
+    
+    <div class="cabecalho-gov">
+        <h1>🏛️ Portal de Decisões - GGTAB</h1>
+        <span class="badge-versao">Ambiente DSpace + OCR (v11.5)</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+AUTOR_COMPLETO = "Agência Nacional de Vigilância Sanitária (ANVISA), Terceira Diretoria (DIRE3), Gerência-Geral de Registro e Fiscalização de Produtos Fumígenos, Derivados ou não do Tabaco (GGTAB)"
+CABECALHO_PADRAO = "AGÊNCIA NACIONAL DE VIGILÂNCIA SANITÁRIA\nTERCEIRA DIRETORIA (DIR3)\nGERÊNCIA-GERAL DE REGISTRO E FISCALIZAÇÃO DE PRODUTOS FUMÍGENOS, DERIVADOS OU NÃO DO TABACO (GGTAB)"
+
+# ==========================================
+# 2. MOTOR DE EXTRAÇÃO (CÉREBRO COM OCR)
+# ==========================================
+def extrair_dados_pdf(arquivo_bytes):
+    leitor = PdfReader(io.BytesIO(arquivo_bytes))
+    texto_completo = ""
+    for pagina in leitor.pages:
+        texto_extraido = pagina.extract_text()
+        if texto_extraido: texto_completo += texto_extraido + "\n"
+        
+    # OCR FALLBACK (Para documentos digitalizados)
+    if not texto_completo.strip():
+        if OCR_DISPONIVEL:
+            st.toast("⚠️ Texto digital não detetado. A iniciar Motor de OCR...", icon="🔍")
+            try:
+                imagens = convert_from_bytes(arquivo_bytes)
+                for img in imagens:
+                    texto_completo += pytesseract.image_to_string(img, lang='por') + "\n"
+            except Exception as e:
+                st.error(f"Falha no motor OCR: {e}")
+        else:
+            st.error("⚠️ Documento digitalizado detetado, mas as bibliotecas de OCR não estão instaladas. Preenchimento manual necessário.")
+
+    texto_limpo = re.sub(r'\s+', ' ', texto_completo)
+    
+    dados = {
+        "num_decisao": "", "processo": "", "autuado": "", "documento": "Não possui", "auto_infracao": "",
+        "penalidade": "", "tipo_decisao": "", "resumo": "", "enquadramento": "", 
+        "info_adicional": "", "palavras_chave": "", "data_pub": "", "qtd_paginas": len(leitor.pages)
+    }
+    
+    matches_data = re.findall(r"assinado eletronicamente.*?em\s+(\d{2}/\d{2}/\d{4})", texto_limpo, re.IGNORECASE)
+    if matches_data: dados["data_pub"] = matches_data[-1] 
+
+    match_decisao = re.search(r"DECIS[AÃ]O\s*(?:N[º°o]\s*)?([0-9\.\/-]+)", texto_completo, re.IGNORECASE)
+    if match_decisao and any(char.isdigit() for char in match_decisao.group(1)): dados["num_decisao"] = match_decisao.group(1).strip()
+    
+    match_processo = re.search(r"Processo(?:s)?\s*(?:n[º°o\.])?\s*[:\-]?\s*([0-9\.\/-]+)", texto_completo, re.IGNORECASE)
+    if match_processo: dados["processo"] = match_processo.group(1).strip()
+    
+    match_autuado = re.search(r"(?:Autuad[ao]|Empresa|Interessad[ao])\s*[:\-]?\s*([^\n\r]+)", texto_completo, re.IGNORECASE)
+    if match_autuado: dados["autuado"] = re.split(r'\s*-\s*CNPJ|\s*CNPJ|\s*CPF|\s*AIS', match_autuado.group(1), flags=re.IGNORECASE)[0].strip()
+    
+    match_ais = re.search(r"AIS\s*(?:n(?:[º°o]|.)?)?\s*[:\-]?\s*([^\n\r]+)", texto_completo, re.IGNORECASE)
+    if match_ais: dados["auto_infracao"] = match_ais.group(1).strip()
+    
+    match_expediente = re.search(r"Expediente\s*(?:do\s*Recurso)?\s*(?:n(?:[º°o]|.)?)?\s*[:\-]?\s*([^\n\r]+)", texto_completo, re.IGNORECASE)
+    if match_expediente: dados["info_adicional"] = f"Expediente do Recurso: {match_expediente.group(1).strip()}"
+
+    bloco_decisao = re.search(r"(?:aplico|condenada(?: ao pagamento)?|aplicada)(.*?)(?:Publique-se|Encaminhem-se|Desse modo)", texto_limpo, re.IGNORECASE)
+    
+    if bloco_decisao:
+        trecho = bloco_decisao.group(1)
+        match_total = re.search(r"(multa.*?valor total.*?R\$\s*[\d\.,]+(?:\s*\([^)]+\))?)", texto_limpo, re.IGNORECASE)
+        if match_total:
+            dados["penalidade"] = match_total.group(1).capitalize()
+        else:
+            valores_rs = re.findall(r"R\$\s*[\d\.,]+", trecho, re.IGNORECASE)
+            tem_advertencia = re.search(r"\badvert[êe]ncia\b", trecho, re.IGNORECASE)
+            tem_interdicao = re.search(r"\binterdi[çc][ãa]o\b", trecho, re.IGNORECASE)
+            
+            if len(valores_rs) > 1:
+                texto_penal = f"Múltiplas multas ({' + '.join(valores_rs)})"
+                if tem_advertencia: texto_penal += " + Advertência"
+                if tem_interdicao: texto_penal += " + Interdição"
+                dados["penalidade"] = texto_penal
+            elif len(valores_rs) == 1:
+                match_unica = re.search(r"(multa.*?R\$\s*[\d\.,]+(?:\s*\([^)]+\))?)", texto_limpo, re.IGNORECASE)
+                if match_unica: dados["penalidade"] = match_unica.group(1).capitalize()
+                else: dados["penalidade"] = f"Multa no valor de {valores_rs[0]}"
+                if tem_advertencia: dados["penalidade"] += " e Advertência"
+            else:
+                outras = re.search(r"\b(advert[êe]ncia|notifica[çc][ãa]o|arquivamento|interdi[çc][ãa]o|cancelamento)\b", trecho, re.IGNORECASE)
+                if outras: dados["penalidade"] = outras.group(1).capitalize()
+                
+    if not dados.get("penalidade"):
+        match_multa = re.search(r"(multa.*?R\$\s*[\d\.,]+(?:\s*\([^)]+\))?)", texto_limpo, re.IGNORECASE)
+        if match_multa: dados["penalidade"] = match_multa.group(1).capitalize()
+        else:
+            outras = re.search(r"\b(advert[êe]ncia|notifica[çc][ãa]o|arquivamento|interdi[çc][ãa]o|cancelamento)\b", texto_limpo, re.IGNORECASE)
+            if outras: dados["penalidade"] = outras.group(1).capitalize()
+            else: dados["penalidade"] = "Não identificada (Revisar manualmente)"
+
+    match_doc = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2})", texto_completo)
+    if match_doc: dados["documento"] = match_doc.group(1).strip()
+
+    linhas = texto_completo.split('\n')
+    tipo_decisao_linhas = []
+    capturando_tipo = False
+    
+    for linha in linhas:
+        linha_strip = linha.strip()
+        if not linha_strip: continue
+        if re.match(r"^DECIS[AÃ]O\s*(?:N[º°o]\s*)?[0-9\.\/-]+$", linha_strip, re.IGNORECASE): continue
+            
+        if not capturando_tipo and re.match(r"^(DECIS[AÃ]O|JULGAMENTO|CANCELAMENTO|NOTIFICA[CÇ][AÃ]O)", linha_strip, re.IGNORECASE):
+            capturando_tipo = True
+            tipo_decisao_linhas.append(linha_strip)
+            continue
+            
+        if capturando_tipo:
+            if re.search(r"^(Processo|Autuad|Empresa|Interessad|AIS|CNPJ|CPF|Expediente)", linha_strip, re.IGNORECASE) or len(tipo_decisao_linhas) >= 4: break
+            tipo_decisao_linhas.append(linha_strip)
+
+    if tipo_decisao_linhas: dados["tipo_decisao"] = " ".join(tipo_decisao_linhas).upper()
+    if not dados["tipo_decisao"]:
+        if "arquivamento" in dados.get("penalidade", "").lower(): dados["tipo_decisao"] = "DECISÃO DE ARQUIVAMENTO"
+        else: dados["tipo_decisao"] = "DECISÃO ADMINISTRATIVA"
+            
+    match_enquadramento = re.search(r"(art(?:igo|\.)\s*\d+.*?Lei.*?\d{4}|Resolu[çc][ãa]o.*?RDC.*?\d{4})", texto_limpo, re.IGNORECASE)
+    if match_enquadramento: dados["enquadramento"] = "Infração conforme o " + match_enquadramento.group(1).strip()
+    
+    match_conclusao = re.search(r"((?:Desse\s*modo|Diante\s*do\s*exposto|Ante\s*o\s*exposto|Isto\s*posto|Pelo\s*exposto|Assim|Considerando).*?(?:proferida|penalidade|arquivamento|provimento|improcedente|procedente|mantida|notificada|advertida|Sanitário)\.)", texto_limpo, re.IGNORECASE)
+    if match_conclusao: dados["resumo"] = match_conclusao.group(1).strip()
+    else:
+        match_decide = re.search(r"(Decid(?:o|e-se).*?\.|Julg(?:o|a-se).*?\.|Fica.*?(?:advertida|notificada).*?\.)", texto_limpo, re.IGNORECASE)
+        if match_decide: dados["resumo"] = match_decide.group(1).strip()
+            
+    palavras = [dados["tipo_decisao"].title()] if dados["tipo_decisao"] else []
+    if "multa" in dados.get("penalidade", "").lower(): palavras.append("Multa")
+    if "advert" in dados.get("penalidade", "").lower(): palavras.append("Advertência")
+    if "interdi" in dados.get("penalidade", "").lower(): palavras.append("Interdição")
+    if "arquivamento" in dados.get("penalidade", "").lower(): palavras.append("Arquivamento")
+    if "NÃO RETRATAÇÃO" in dados.get("tipo_decisao", "").upper(): palavras.append("Recurso Administrativo")
+    dados["palavras_chave"] = ", ".join(list(dict.fromkeys(palavras)))
+
+    return dados
+
+# ==========================================
+# 3. INTERFACE DE ENTRADA
+# ==========================================
+arquivo_pdf = st.file_uploader("📄 Anexe o ficheiro PDF do Processo SEI", type=["pdf"])
+
+if arquivo_pdf and st.session_state.get("ultimo_arquivo") != arquivo_pdf.name:
+    with st.spinner("🤖 A analisar o documento e extrair metadados..."):
+        try:
+            arquivo_bytes = arquivo_pdf.getvalue()
+            dados_extraidos = extrair_dados_pdf(arquivo_bytes)
+            st.session_state.dados.update(dados_extraidos)
+            st.session_state.ultimo_arquivo = arquivo_pdf.name
+            st.session_state.preview = False
+            st.toast("Ficheiro processado com sucesso!", icon="✅")
+        except Exception as e:
+            st.error(f"⚠️ Erro de Leitura: O documento pode estar corrompido. ({e})")
+
+# ==========================================
+# 4. FORMULÁRIO DE REVISÃO
+# ==========================================
+with st.expander("📝 1. REVISÃO DE METADADOS DO PROCESSO", expanded=True):
+    c1, c2, c3 = st.columns(3)
+    with c1: num_decisao = st.text_input("Nº Decisão", value=st.session_state.dados["num_decisao"])
+    with c2: local = st.selectbox("Local", ["Brasília", "Rio de Janeiro"], index=0 if st.session_state.dados.get("local", "Brasília") == "Brasília" else 1)
+    with c3: data_pub = st.text_input("Data Publicação (DD/MM/AAAA) *Obrigatório*", value=st.session_state.dados["data_pub"])
+
+    c_area, c_tipo = st.columns(2)
+    with c_area: area = st.text_input("Área Responsável", value=st.session_state.dados["area"])
+    with c_tipo: tipo_decisao = st.text_input("Tipo de Decisão", value=st.session_state.dados["tipo_decisao"])
+
+    c4, c5 = st.columns(2)
+    with c4:
+        processo = st.text_input("Processo", value=st.session_state.dados["processo"])
+        autuado = st.text_input("Autuado", value=st.session_state.dados["autuado"])
+        documento = st.text_input("CNPJ ou CPF", value=st.session_state.dados["documento"])
+    with c5:
+        auto_infracao = st.text_input("Auto de Infração nº", value=st.session_state.dados["auto_infracao"])
+        penalidade = st.text_input("Penalidade", value=st.session_state.dados["penalidade"])
+        palavras_chave = st.text_input("Palavras-chave (separadas por vírgula)", value=st.session_state.dados["palavras_chave"])
+
+    enquadramento = st.text_area("Enquadramento Legal", value=st.session_state.dados["enquadramento"], height=68)
+    resumo = st.text_area("Resumo da Decisão", value=st.session_state.dados["resumo"], height=100)
+    info_adicional = st.text_area("Informações Adicionais", value=st.session_state.dados["info_adicional"], height=68)
+
+# ==========================================
+# 5. PRÉ-VISUALIZAÇÃO SIMPLIFICADA E GERAÇÃO
+# ==========================================
+st.markdown("<br>", unsafe_allow_html=True)
+col_btn1, col_btn2 = st.columns([3, 1])
+
+with col_btn1:
+    if st.button("👁️ 2. Gerar Visualização e PDF Oficial", use_container_width=True):
+        st.session_state.preview = True
+with col_btn2:
+    if st.button("🗑️ Limpar Formulário", use_container_width=True):
+        limpar_tudo()
+        st.rerun()
+
+if st.session_state.get("preview", False):
+    if not arquivo_pdf and not num_decisao: 
+        st.error("⚠️ Anexe o ficheiro ou preencha os dados primários.")
+    elif not data_pub.strip(): 
+        st.error("⚠️ O campo da Data de Publicação é obrigatório.")
+    else:
+        # Tratamento LGPD Automático
+        doc_str = str(documento).strip()
+        if doc_str.lower() == "não possui" or not doc_str:
+            doc_f, nome_f = "Não possui", autuado
+        else:
+            doc_limpo = re.sub(r'[^0-9]', '', doc_str)
+            nome_f = "***" if len(doc_limpo) == 11 else autuado
+            doc_f = "***.***.***-**" if len(doc_limpo) == 11 else doc_str
+        
+        titulo_oficial = f"GGTAB-DIRE3-ANVISA - DECISÃO Nº {num_decisao}" if num_decisao else "GGTAB-DIRE3-ANVISA - DECISÃO"
+        titulo_busca = f"DECISÃO Nº {num_decisao} - GGTAB/DIRE3/ANVISA" if num_decisao else "DECISÃO - GGTAB/DIRE3/ANVISA"
+        
+        st.markdown("### 🔍 3. Painel de Pré-visualização")
+        
+        texto_final_simples = f"""==================================================================
+📋 INFORMAÇÕES DO SISTEMA (VISÃO DE LEITURA)
+==================================================================
+Título: {titulo_oficial}
+Nome de Exibição na Busca: {titulo_busca}
+Autor: {AUTOR_COMPLETO}
+Local e Data (Ano): {local}, {data_pub}
+Número do Processo: {processo}
+Palavras-chave: {palavras_chave}
+
+==================================================================
+📄 EXTRATO DA DECISÃO
+==================================================================
+EXTRATO DE DECISÃO - {tipo_decisao.upper()}
+
+Processo nº: {processo}
+Autuado: {nome_f}
+CNPJ/CPF: {doc_f}
+Auto de Infração nº: {auto_infracao}
+Infração/Enquadramento: {enquadramento}
+Penalidade: {penalidade}
+
+Resumo:
+{resumo}
+
+Informações adicionais:
+{info_adicional if info_adicional else 'Não constam.'}
+=================================================================="""
+        
+        st.text_area("Visão Estruturada:", value=texto_final_simples, height=450, disabled=True)
+
+        # ==========================================
+        # GERAÇÃO DO PDF OFICIAL ESTRUTURADO (FPDF)
+        # ==========================================
+        pdf = FPDF()
+        pdf.add_page()
+        
+        # Cabeçalho
+        pdf.set_font("Arial", 'B', 11)
+        pdf.multi_cell(0, 6, txt=CABECALHO_PADRAO.encode('latin-1', 'replace').decode('latin-1'), align='C')
+        pdf.ln(3)
+        pdf.set_line_width(0.3)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(6)
+        
+        # Título da Decisão
+        pdf.set_font("Arial", 'B', 12)
+        pdf.multi_cell(0, 6, txt=f"EXTRATO DE DECISÃO - {tipo_decisao.upper()}".encode('latin-1', 'replace').decode('latin-1'), align='C')
+        pdf.ln(8)
+        
+        # Bloco 1: Gerais
+        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(0, 6, txt="INFORMAÇÕES GERAIS:", ln=1)
+        pdf.set_font("Arial", '', 10)
+        pdf.multi_cell(0, 5, txt=f"Título: {titulo_oficial}\nLocal e Data: {local}, {data_pub}\nÁrea Responsável: {area}\nPalavras-chave: {palavras_chave}".encode('latin-1', 'replace').decode('latin-1'))
+        pdf.ln(5)
+        
+        # Bloco 2: Processo
+        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(0, 6, txt="DADOS DO PROCESSO:", ln=1)
+        pdf.set_font("Arial", '', 10)
+        pdf.multi_cell(0, 5, txt=f"Processo nº: {processo}\nAutuado: {nome_f}\nCNPJ/CPF: {doc_f}\nAuto de Infração nº: {auto_infracao}\nInfração/Enquadramento: {enquadramento}\nPenalidade: {penalidade}".encode('latin-1', 'replace').decode('latin-1'))
+        pdf.ln(5)
+        
+        # Bloco 3: Resumo
+        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(0, 6, txt="RESUMO DA DECISÃO:", ln=1)
+        pdf.set_font("Arial", '', 10)
+        pdf.multi_cell(0, 5, txt=resumo.encode('latin-1', 'replace').decode('latin-1'))
+        pdf.ln(5)
+        
+        # Bloco 4: Adicionais
+        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(0, 6, txt="INFORMAÇÕES ADICIONAIS:", ln=1)
+        pdf.set_font("Arial", '', 10)
+        texto_ad = info_adicional if info_adicional else 'Não constam.'
+        pdf.multi_cell(0, 5, txt=texto_ad.encode('latin-1', 'replace').decode('latin-1'))
+        
+        # Mesclagem
+        pdf_bytes = pdf.output(dest='S')
+        pdf_bytes = pdf_bytes.encode('latin-1') if isinstance(pdf_bytes, str) else pdf_bytes
+        
+        writer = PdfWriter()
+        reader_capa = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader_capa.pages: writer.add_page(page)
+        
+        if arquivo_pdf:
+            arquivo_pdf.seek(0)
+            reader_original = PdfReader(arquivo_pdf)
+            for page in reader_original.pages: writer.add_page(page)
+        
+        pdf_mesclado = io.BytesIO()
+        writer.write(pdf_mesclado)
+        pdf_mesclado_bytes = pdf_mesclado.getvalue()
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        col_pub1, col_pub2 = st.columns(2)
+        
+        with col_pub1:
+            if st.button("🚀 4. Confirmar e Publicar", type="primary", use_container_width=True):
+                # Guarda no histórico ao confirmar
+                st.session_state.historico.append(st.session_state.dados.copy())
+                st.success("✅ Tudo pronto! O documento já pode ser anexado e os dados estão salvos no Histórico da Sessão (Menu Lateral).")
+                st.balloons()
+        with col_pub2:
+            st.download_button(
+                label="📥 Transferir Extrato Oficial + Processo",
+                data=pdf_mesclado_bytes,
+                file_name=f"Publicacao_GGTAB_{num_decisao}.pdf",
+                mime="application/pdf",
+                use_container_width=True
+            )
