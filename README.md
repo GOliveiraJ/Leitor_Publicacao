@@ -1,4 +1,4 @@
-# Leitor-de-Publicao.py
+# Leitor-de-Publicacao.py
 
 # 🏛️ Portal GGTAB - Extrator e Gerador de Decisões (SEI)
 
