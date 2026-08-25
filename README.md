@@ -1,0 +1,1 @@
+# Leitor-de-Publica-o.py
