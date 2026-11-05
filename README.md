@@ -38,4 +38,3 @@ O sistema resolve o gargalo da leitura manual de PDFs do sistema SEI, utilizando
   Tesseract OCR: Guia de Instalação
   Poppler (necessário para o pdf2image): Guia de Instalação
   streamlit run app.py
-
